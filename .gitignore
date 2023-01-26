@@ -1,0 +1,7 @@
+.vscode
+build
+
+data/lego/sparse
+docs/html
+docs/latex
+imgui.ini
