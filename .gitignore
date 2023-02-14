@@ -2,6 +2,7 @@
 build
 
 data/lego/sparse
+data/lego/database.db
 docs/html
 docs/latex
 imgui.ini
