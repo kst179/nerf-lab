@@ -13,6 +13,7 @@
 #include <tiny-cuda-nn/network.h>
 #include <tiny-cuda-nn/gpu_matrix.h>
 #include <tiny-cuda-nn/gpu_memory.h>
+
 #include <nerf-lab/models/type_traits.h>
 
 #include <vector>
@@ -24,17 +25,25 @@ struct FulllyFusedMatMulCalculationPolicy {
 private:
     template <bool ACC>
     static constexpr uint32_t define_skew() {
+        constexpr uint32_t elements_per_storage_unit = helper_traits<T>::elements_per_storage_unit;
         constexpr uint32_t block_width = helper_traits<T>::block_width;
-        constexpr uint32_t storage_block_width = ACC ? block_width : block_width / helper_traits<T>::elements_per_storage_unit;
+        constexpr uint32_t storage_block_width = ACC ? block_width : block_width / elements_per_storage_unit;
         constexpr uint32_t storage_size = ACC ? sizeof(accumulator_t<T>) : sizeof(storage_t<T>);
 
-        // 128 = 4 * 32 the memory (in bytes) which can be acessed by all shared banks at once
-        // if block_width == WIDTH then there is no unused banks while copying one block
-        if (storage_block_width * storage_size >= 128 || block_width == WIDTH) {
-            return 0;
-        } else {
-            return 16 / storage_size;
+        // if width < block_width (for example 64-wide binary net would not fit into 128 bit tensor core)
+        // then skew is used to pad input matrix with zeroes
+        if (!ACC & WIDTH < block_width) {
+            return (block_width - WIDTH) / elements_per_storage_unit;
         }
+        
+        // 128 = 4 * 32 the memory (in bytes) which can be acessed by all shared banks at once 
+        // If we can copy one full row at a time (or in several iterations), then skew is not needed
+        // Also, if block_width == WIDTH then there is no unused banks while loading blocks to TC 
+        if (storage_block_width * storage_size % 128 == 0 || block_width == WIDTH) {
+            return 0;
+        }
+
+        return 16 / storage_size;
     }
 
 public:
@@ -54,9 +63,11 @@ public:
     static const uint32_t block_height          = helper_traits<T>::block_height;
     static const uint32_t block_width           = helper_traits<T>::block_width;
 
+    static const bool partial_tc_load           = chunk_width < block_width;
+
     static const uint32_t n_blocks_col          = chunk_width / block_height;
     static const uint32_t n_blocks_row          = chunk_height / block_height;
-    static const uint32_t n_weight_blocks       = chunk_width / block_width;
+    static const uint32_t n_weight_blocks       = partial_tc_load ? 1 : chunk_width / block_width;
 
     static const uint32_t n_iters_col           = n_blocks_col / n_warps_col;
     static const uint32_t n_iters_row           = n_blocks_row / n_warps_row;
@@ -66,18 +77,20 @@ public:
     static const uint32_t width_offset          = n_iters_col * block_height;
     static const uint32_t height_offset         = n_iters_row * block_height;
 
-    static const uint32_t storage_width         = WIDTH / helper_traits<T>::elements_per_storage_unit;
+    static const uint32_t storage_width         = chunk_width / helper_traits<T>::elements_per_storage_unit;
     static const uint32_t storage_block_width   = block_width / helper_traits<T>::elements_per_storage_unit;
     static const uint32_t storage_chunk_size    = chunk_height * storage_width;
-    static const uint32_t storage_ldm           = chunk_width;
-
+    static const uint32_t storage_ldm           = partial_tc_load ? block_width : chunk_width;
+    static const uint32_t padded_storage_width  = partial_tc_load ? block_width / helper_traits<T>::elements_per_storage_unit
+                                                                  : storage_width;
+    
     static const uint32_t shmem_skew            = define_skew<false>();
     static const uint32_t shmem_stride          = storage_width + shmem_skew;
     static const uint32_t shmem_size            = chunk_height * shmem_stride;
     static const uint32_t shmem_ldm             = shmem_stride * helper_traits<T>::elements_per_storage_unit;
 
     static const uint32_t acc_shmem_skew        = define_skew<true>();
-    static const uint32_t acc_shmem_stride      = WIDTH + acc_shmem_skew;
+    static const uint32_t acc_shmem_stride      = chunk_width + acc_shmem_skew;
     static const uint32_t acc_shmem_size        = chunk_height * acc_shmem_stride;
     static const uint32_t acc_shmem_ldm         = acc_shmem_stride;
 
@@ -85,8 +98,11 @@ public:
     static const uint32_t copy_step = n_warps * warp_size * copy_stride;
 
     // static checks
-    static_assert(chunk_width % n_warps_col == 0, "chunk_width should be divisible by n_warps_col");
+    static_assert(chunk_width % n_warps_col == 0, "width should be divisible by n_warps_col");
     static_assert(chunk_height % n_warps_row == 0, "chunk_height should be divisible by n_warps_row");
+    static_assert(chunk_width % block_width == 0 || chunk_width < block_width, "width should be divisible by block_width or be less than it");
+    static_assert(chunk_height % block_height == 0, "chunk_height should be divisible by block_height");
+
     static_assert(sizeof(copy_type) >= sizeof(storage_type), "Size of copy type should not be less than size of storage type");
 
     static_assert(storage_chunk_size % copy_step == 0, "Chunk size should be divisible by the amount of memory which can be loaded or stored by one threadblock. "
@@ -132,11 +148,11 @@ __device__ void threadblock_load_input_static(
 	const uint32_t col = (lane_idx * _::copy_stride) % _::storage_width;
 	const uint32_t row = (lane_idx + warp_idx * _::warp_size) * _::copy_stride / _::storage_width;
 
-    // each lane (of WARP_SIZE lanes) copies COPY_STRIDE elements in single vector uint4 operation (or different T_COPY type, if specified)
-    // each warp (of N_WARPS warps) copies WARP_SIZE * COPY_STRIDE elements
-    // full threadblock copies then N_WARPS * WARP_SIZE * COPY_STRIDE elements at once, 
-    // then repeats untill all of CHUNK_SIZE elements are copied.
-	TCNN_PRAGMA_UNROLL
+    // each lane (of `warp_size` lanes) copies `copy_stride` elements in single vector uint4 operation (or different T_COPY type, if specified)
+    // each warp (of `n_warps` warps) copies `warp_size * copy_stride` elements
+    // full threadblock copies then `n_warps * warp_size * copy_stride` elements at once, 
+    // then repeats untill all of `storage_chunk_size` elements are copied.
+	#pragma unroll
 	for (uint32_t offset = 0; offset < _::storage_chunk_size; offset += _::copy_step) {
         const uint32_t shmem_offset = offset / _::storage_width * _::shmem_stride;
 
@@ -146,6 +162,7 @@ __device__ void threadblock_load_input_static(
 
     __syncthreads();
 }
+
 
 
 /*
@@ -178,21 +195,58 @@ __device__ void threadblock_store_output_static(
     __syncthreads();
 }
 
+template <
+    typename CalculationPolicy,
+    typename T_ST = typename CalculationPolicy::storage_type
+>
+__device__ void fill_zeroes(
+    T_ST* __restrict__ act_shmem
+) {
+    using _ = CalculationPolicy;
+
+    constexpr uint32_t copy_stride = sizeof(uint32_t) / sizeof(T_ST);
+    constexpr uint32_t copy_step = _::n_warps * _::warp_size * copy_stride;
+
+	const uint32_t lane_idx = threadIdx.x;
+	const uint32_t warp_idx = threadIdx.y;
+
+    const uint32_t i = (warp_idx * _::warp_size + lane_idx) * copy_stride;
+
+	#pragma unroll
+	for (uint32_t offset = 0; offset < _::shmem_size; offset += copy_step) {
+		*(uint32_t*)&act_shmem[offset + i] = 0;
+	}
+
+    __syncthreads(); 
+
+    // if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+    //     printf("%d %d %d %d %d\n", copy_stride, copy_step, _::shmem_stride, _::shmem_size, _::chunk_height);
+        
+    //     for (int i = 0; i < _::chunk_height; ++i) {
+    //         for (int j = 0; j < _::shmem_stride; ++j) {
+    //             printf("%08x ", act_shmem[i * _::shmem_stride + j]);
+    //         }
+    //         printf("\n");
+    //     }
+    //     printf("\n");
+    // }
+
+    // __syncthreads();
+}
+
 template <typename T, typename CalculationPolicy>
 struct NumericConverter;
 
 template <typename CalculationPolicy>
 struct NumericConverter<__half, CalculationPolicy> { 
-    TCNN_DEVICE 
-    static inline void convert(storage_t<__half>* __restrict__ act_shmem, const accumulator_t<__half>* __restrict__ aux_shmem) { 
+    __device__ static inline void convert(storage_t<__half>* __restrict__ act_shmem, const accumulator_t<__half>* __restrict__ aux_shmem) { 
         assert(false); // Not implemented error
     }
 };
 
 template <typename CalculationPolicy>
 struct NumericConverter<int8_t, CalculationPolicy> {
-    TCNN_DEVICE
-    static inline void convert(storage_t<int8_t>* __restrict__ act_shmem, const accumulator_t<int8_t>* __restrict__ aux_shmem) { 
+    __device__ static inline void convert(storage_t<int8_t>* __restrict__ act_shmem, const accumulator_t<int8_t>* __restrict__ aux_shmem) { 
         using _ = CalculationPolicy;
 
         // sizeof(int4)    == 4 * sizeof(int32_t)
@@ -238,8 +292,7 @@ struct NumericConverter<int8_t, CalculationPolicy> {
 
 template <typename CalculationPolicy>
 struct NumericConverter<int4b_t, CalculationPolicy> {
-    TCNN_DEVICE 
-    static inline void convert(storage_t<int4b_t>* __restrict__ act_shmem, const accumulator_t<int4b_t>* __restrict__ aux_shmem) { 
+    __device__ static inline void convert(storage_t<int4b_t>* __restrict__ act_shmem, const accumulator_t<int4b_t>* __restrict__ aux_shmem) { 
         using _ = CalculationPolicy;
         
         constexpr uint32_t copy_stride = 8;
@@ -286,8 +339,7 @@ struct NumericConverter<int4b_t, CalculationPolicy> {
 
 template <typename CalculationPolicy>
 struct NumericConverter<uint1b_t, CalculationPolicy> {
-    TCNN_DEVICE 
-    static inline void convert(storage_t<uint1b_t>* __restrict__ act_shmem, const accumulator_t<uint1b_t>* __restrict__ aux_shmem) { 
+    __device__ static inline void convert(storage_t<uint1b_t>* __restrict__ act_shmem, const accumulator_t<uint1b_t>* __restrict__ aux_shmem) { 
         using _ = CalculationPolicy;
         
         constexpr uint32_t copy_stride = 32;
@@ -304,32 +356,14 @@ struct NumericConverter<uint1b_t, CalculationPolicy> {
 
         const uint32_t storage_col = col / helper_traits<uint1b_t>::elements_per_storage_unit;
 
-#if false
-        __syncthreads();
-        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-            for (int i = 0; i < min(_::chunk_height, 16); ++i) {
-                printf("%4d | ", i);
-                for (int j = 0; j < _::chunk_width; ++j) {
-                    uint32_t x = aux_shmem[i * _::acc_shmem_stride + j];
-                    printf((x & 1) ? "1" : "0");
-                    if (j % 8 == 7) printf(" ");
-                    if (j % 32 == 31) printf(" ");
-                }
-                printf("\n");
-            }
-            printf("\n\n");
-        }
-        __syncthreads();
-#endif
-
-        TCNN_PRAGMA_UNROLL
+        #pragma unroll
         for (uint32_t offset = 0; offset < _::chunk_size; offset += step) {
             const uint32_t aux_shmem_offset = offset / _::chunk_width * _::acc_shmem_stride;
             const uint32_t shmem_offset = offset / _::chunk_width * _::shmem_stride;
 
             uint32_t bits32 = 0;
 
-            TCNN_PRAGMA_UNROLL
+            #pragma unroll
             for (uint32_t i = 0; i < 8; ++i) {
                 const uint32_t j = ((lane_idx + i) % 8) * 4;
                 const uint4 vec = *(uint4*)&aux_shmem[aux_shmem_offset + row * _::acc_shmem_stride + col + j];
@@ -346,26 +380,6 @@ struct NumericConverter<uint1b_t, CalculationPolicy> {
         }
 
         __syncthreads();
-
-#if false
-        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-            for (int i = 0; i < min(_::chunk_height, 16); ++i) {
-                printf("%4d | ", i);
-                for (int j = 0; j < _::storage_width; ++j) {
-                    uint32_t x = act_shmem[i * _::shmem_stride + j];
-                    for (int k = 0; k < 32; ++k) {
-                        printf((x & (1 << k)) ? "1" : "0");
-                        if (k % 8 == 7) printf(" ");
-                    }
-                    printf(" ");
-                }
-                printf("\n");
-            }
-            printf("\n\n");
-        }
-
-        __syncthreads();
-#endif
 
     }
 };
@@ -435,6 +449,10 @@ __device__ inline void downcast_copy(int8_t* __restrict__ act_shmem, const int32
 }
 */
 
+
+/*
+ * Function to unify access to wmma::mma_sync and bmma_sync via single interface
+ */
 template<typename F_A, typename F_B, typename F_ACC>
 __device__ void mma_sync(F_ACC& result_frag, const F_A& act_frag, const F_B& weights_frag) {
     nvcuda::wmma::mma_sync(result_frag, act_frag, weights_frag, result_frag);
@@ -475,7 +493,7 @@ __device__ void qat_threadblock_layer(
 
     static_assert(!BACKWARD || half_mode, "Backward threadblock layer is available only for T=__half, "
                                           "integer types should be used for inference only!");
-
+    static_assert(!half_mode || !_::partial_tc_load, "In half mode width should not be less than block width!");
     static_assert(!half_mode || _::n_iters_col == 1, "If use half mode, matmul result is stored inplace into shared memory, "
                                                      "so we write to the matrix rows from which then read for further multiplications, "
                                                      "if all operations are not done in parallel. "
@@ -499,70 +517,27 @@ __device__ void qat_threadblock_layer(
 	const uint32_t col_offset = _::width_offset * (warp_idx % _::n_warps_col);
     const uint32_t row_offset = _::height_offset * (warp_idx / _::n_warps_col);
 
-#if false
-    // if (blockIdx.x == 0 && threadIdx.x == 0) {
-    //     printf("warp: %d, col_offset: %d, row_offset %d\n", warp_idx, col_offset, row_offset);
-    // }
-
-    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-        printf("INPUT SHMEM:\n");
-        for (int i = 0; i < min(_::chunk_height, 16); ++i) {
-            printf("%4d | ", i);
-            for (int j = 0; j < _::chunk_width; ++j) {
-                float x = act_shmem[i * _::shmem_stride + j];
-                printf("%8.3f ", x);
-            }
-            printf("\n");
-        }
-        printf("\n");
-    }
-	__syncthreads();
-#endif
-
-#if false
-    __syncthreads();
-
-    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-        for (int i = 0; i < min(_::chunk_height, 16); ++i) {
-            printf("%4d | ", i);
-            for (int j = 0; j < _::storage_width; ++j) {
-                uint32_t x = act_shmem[i * _::shmem_stride + j];
-                for (int k = 0; k < 32; ++k) {
-                    printf((x & (1 << k)) ? "1" : "0");
-                    if (k % 8 == 7) printf(" ");
-                }
-                printf(" ");
-            }
-            printf("\n");
-        }
-        printf("\n\n");
-    }
-
-    __syncthreads();
-#endif
-
-    TCNN_PRAGMA_UNROLL
-    // for (uint32_t iter_col = 0; iter_col < _::n_iters_col; ++iter_col) {
-    for (int32_t iter_col = _::n_iters_col-1; iter_col > -1; --iter_col) {
+    #pragma unroll
+    for (uint32_t iter_col = 0; iter_col < _::n_iters_col; ++iter_col) {
         const uint32_t weights_col = col_offset + iter_col * _::block_height;
      
         // Load N_BLOCKS chunks of weights from global memory into registers.
-        TCNN_PRAGMA_UNROLL
+        #pragma unroll
         for (uint32_t block = 0; block < _::n_weight_blocks; ++block) {
-            const uint32_t row = block * _::storage_block_width;
+            constexpr uint32_t weights_ldm = _::partial_tc_load ? _::block_width : _::chunk_width;
 
-            // if (blockIdx.x == 0 && threadIdx.x == 0) printf("wi: %d, load weights at [%d, %d] to %d weight block\n", warp_idx, row, weights_col, block);
+            const uint32_t row = block * _::storage_block_width;
 
             if (BACKWARD) {
                 // If we're performing the backward pass, additional index swizzling is needed to load the weights in transposed form.
-                // BACKWARD is available only for T=__half so chunk_width is used as stride here.
+                // backward is available only for T=__half, and and partial tensor core load is not, so chunk_width is used as stride here.
                 wmma::load_matrix_sync(weights_frag[block], weights_this_layer + row * _::chunk_width + weights_col, _::chunk_width);
             } else {
-                wmma::load_matrix_sync(weights_frag[block], weights_this_layer + row + weights_col * _::storage_width, _::chunk_width);
+                wmma::load_matrix_sync(weights_frag[block], weights_this_layer + row + weights_col * _::padded_storage_width, weights_ldm);
             }
         }
 
-        TCNN_PRAGMA_UNROLL
+        #pragma unroll
         for (int iter_row = 0; iter_row < _::n_iters_row; ++iter_row) {
             const uint32_t row = row_offset + iter_row * _::block_height;
             
@@ -571,8 +546,6 @@ __device__ void qat_threadblock_layer(
             TCNN_PRAGMA_UNROLL
             for (uint32_t weight_block = 0; weight_block < _::n_weight_blocks; ++weight_block) {
                 const uint32_t col = weight_block * _::storage_block_width;
-
-                // if (blockIdx.x == 0 && threadIdx.x == 0) printf("wi: %d, load acts at [%d, %d], multiply by %d weight block & add to %d acc\n", warp_idx, row, col, weight_block, iter_row);
 
                 // Load a chunk of intermediate activations from shared memory and multiply with chunk of weights
                 wmma::load_matrix_sync(act_frag, act_shmem + row * _::shmem_stride + col, _::shmem_ldm);
@@ -612,8 +585,12 @@ __device__ void qat_threadblock_layer(
             __syncthreads();
         }
 
+        // if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) printf("%u %u %u %u %u %u\n", _::chunk_width, _::block_width, 
+        //                                                                                            _::shmem_skew, _::shmem_stride, 
+        //                                                                                            _::acc_shmem_skew, _::acc_shmem_stride);
+        // return;
         // Copy fragments back to shared memory
-        TCNN_PRAGMA_UNROLL
+        #pragma unroll
         for (int iter_row = 0; iter_row < _::n_iters_row; ++iter_row) {
             const uint32_t row = row_offset + iter_row * _::block_height;
             
@@ -629,39 +606,6 @@ __device__ void qat_threadblock_layer(
         }
 
     }
-
-#if false
-    __syncthreads();
-    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-        printf("OUTPUT SHMEM:\n");
-        for (int i = 0; i < min(_::chunk_height, 16); ++i) {
-            printf("%4d | ", i);
-            for (int j = 0; j < _::chunk_width; ++j) {
-                float x = act_shmem[i * _::shmem_stride + j];
-                printf("%8.3f ", x);
-            }
-            printf("\n");
-        }
-        printf("\n");
-    }
-	__syncthreads();
-#endif
-
-    // if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-    //     for (int i = 0; i < CHUNK_HEIGHT; ++i) {
-    //         printf("%4d | ", i);
-    //         for (int j = 0; j < WIDTH; ++j) {
-    //             float x = act_shmem[i * AUX_SHM_STRIDE + j];
-    //             // x = max(x, 0);
-    //             // x = (int)round((float)x / 256) - 128;
-    //             // x = min(x, 127);
-    //             printf("%8.3f ", x);
-    //         }
-    //         printf("\n");
-    //     }
-    //     printf("\n");
-    // }
-    // __syncthreads();
 
     if (!std::is_same<T, T_ACC>::value) {
         __syncthreads();
@@ -809,5 +753,6 @@ private:
 	std::vector<GPUMatrix<T, RM>> m_gradient_matrices;
 };
 */
+
 
 } // nerf

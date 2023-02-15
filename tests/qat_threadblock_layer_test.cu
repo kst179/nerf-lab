@@ -34,11 +34,28 @@ __global__ void fill_rand(uint32_t size, T* out, tcnn::default_rng_t rng) {
     }
 }
 
-template <typename T, typename T_ACC>
-__global__ void check(uint32_t size, T_ACC* expected, T* actual);
+__global__ void copy_weights_with_pad(
+    uint32_t width,
+    uint32_t padded_width,
+    uint32_t* __restrict__ padded_weights, 
+    const uint32_t* __restrict__ weights
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = i % padded_width;
+    int row = i / padded_width;
+
+    padded_weights[i] = (col < width) ? weights[row * width + col] : 0;
+}
+
+template <
+    typename T, 
+    typename T_ST = storage_t<T>,
+    typename T_ACC = accumulator_t<T>
+>
+__global__ void check(uint32_t size, T_ACC* expected, T_ST* actual);
 
 template <>
-__global__ void check<int8_t, int32_t>(uint32_t size, int32_t* expected, int8_t* actual) {
+__global__ void check<int8_t, int8_t, int32_t>(uint32_t size, int32_t* expected, int8_t* actual) {
     uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 
     if (i >= size) {
@@ -55,7 +72,7 @@ __global__ void check<int8_t, int32_t>(uint32_t size, int32_t* expected, int8_t*
 }
 
 template <>
-__global__ void check<__half, __half>(uint32_t size, __half* expected, __half* actual) {
+__global__ void check<__half, __half, __half>(uint32_t size, __half* expected, __half* actual) {
     uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 
     if (i >= size) {
@@ -71,8 +88,51 @@ __global__ void check<__half, __half>(uint32_t size, __half* expected, __half* a
     }
 }
 
+template <>
+__global__ void check<uint1b_t, uint32_t, int32_t>(uint32_t size, int32_t* expected, uint32_t* actual) {
+    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (i >= size) {
+        return;
+    }
+
+    for (int k = 0; k < 32; ++k) {
+        int x = expected[i * 32 + k] & 1;
+        int y = (actual[i] >> k) & 1;
+
+        if (x != y) {
+            // printf("%4d %f != %f\n", i, x, y);
+            assert(false);
+        }
+    }
+}
+
+template <int WIDTH>
+__global__ void naive_bmm(
+    const uint32_t* __restrict__ in, 
+    const uint32_t* __restrict__ weights, 
+    int32_t* __restrict__ out
+) {
+    constexpr int ST_WIDTH = WIDTH / 32;
+    
+    int row = blockIdx.x;
+    int weights_col = threadIdx.x;
+
+    int32_t y = 0;
+    
+    for (int k = 0; k < ST_WIDTH; ++k) {
+        uint32_t x = in[row * ST_WIDTH + k];
+        uint32_t w = weights[k + weights_col * ST_WIDTH];
+
+        y += __popc(x ^ w);
+    }
+
+    out[row * WIDTH + weights_col] = y;
+}
+
 template <
     typename CalculationPolicy, 
+    typename T = typename CalculationPolicy::mm_type,
     typename T_ST = typename CalculationPolicy::storage_type, 
     typename T_ACC = typename CalculationPolicy::accumulator_type
 >
@@ -83,7 +143,6 @@ __global__ void test_kernel(
     int n_layers = 1
 ) {
     using _ = CalculationPolicy;
-    using T = typename CalculationPolicy::mm_type;
     
     const uint32_t chunk_idx = blockIdx.x;
     const uint32_t chunk_offset = chunk_idx * _::storage_chunk_size;
@@ -91,6 +150,10 @@ __global__ void test_kernel(
     extern __shared__ uint8_t shmem[];
     T_ST* act_shmem = (T_ST*)shmem;
     T_ACC* aux_shmem = (T_ACC*)((T_ST*)shmem + _::shmem_size);
+
+    if (_::partial_tc_load) {
+        fill_zeroes<CalculationPolicy>(act_shmem);
+    }
 
     threadblock_load_input_static<CalculationPolicy>(act_shmem, input + chunk_offset);
 
@@ -102,48 +165,41 @@ __global__ void test_kernel(
     threadblock_store_output_static<CalculationPolicy>(output + chunk_offset, act_shmem);
 }
 
-// template <typename T> struct cutlass_types;
-// template<> struct cutlass_types< uint1b_t > { typedef cutlass::uint1b_t type; typedef int32_t acc_type; };
-// template<> struct cutlass_types<  int4b_t > { typedef  cutlass::int4b_t type; typedef int32_t acc_type; };
-// template<> struct cutlass_types< uint4b_t > { typedef cutlass::uint1b_t type; typedef int32_t acc_type; };
-// template<> struct cutlass_types<   int8_t > { typedef            int8_t type; typedef int32_t acc_type; };
-// template<> struct cutlass_types<  uint8_t > { typedef           uint8_t type; typedef int32_t acc_type; };
-// template<> struct cutlass_types<   __half > { typedef   cutlass::half_t type; typedef  __half acc_type; };
-
-
 template <typename CalculationPolicy>
-std::enable_if_t<
-    std::is_same_v<typename CalculationPolicy::mm_type, __half> || 
-    std::is_same_v<typename CalculationPolicy::mm_type, int8_t>
-> test(uint32_t batch_size) {
+std::enable_if_t< std::is_same_v<typename CalculationPolicy::mm_type, __half> || 
+                  std::is_same_v<typename CalculationPolicy::mm_type, int8_t> > 
+test(uint32_t batch_size) {
     using _ = CalculationPolicy;
     using T = typename CalculationPolicy::mm_type;
     using T_ST = typename CalculationPolicy::storage_type;
     using T_ACC = typename CalculationPolicy::accumulator_type;
-    using T_ACC_CUTLASS = std::conditional_t<std::is_same_v<T, __half>, float, T_ACC>; 
+
+    // Using float accumulator for cutlass multiplication, 
+    // cause __half's reduction sum leads to enormous numerical errors
+    using T_ACC_CUTLASS = std::conditional_t<std::is_same_v<T, __half>, float, T_ACC>;
 
     using GemmOp = cutlass::gemm::device::Gemm<
-        T,                              // A type
-        cutlass::layout::RowMajor,      // A layout
-        T,                              // B type
-        cutlass::layout::ColumnMajor,   // B layout
-        T_ACC,                          // Out type
-        cutlass::layout::RowMajor,      // Out layout
-        T_ACC_CUTLASS                   // Accumulator type
+        /*ElementA =*/ T,
+        /*LayoutA =*/ cutlass::layout::RowMajor,
+        /*ElementB =*/ T,
+        /*LayoutB =*/ cutlass::layout::ColumnMajor,
+        /*ElementC =*/ T_ACC,
+        /*LayoutC =*/ cutlass::layout::RowMajor,
+        /*ElementAccumulator = */ T_ACC_CUTLASS
     >;
 
-    GPUMatrix<T_ST, MatrixLayout::RowMajor> input(batch_size, _::storage_width);
-    GPUMatrix<T_ST, MatrixLayout::ColumnMajor> weights(_::storage_width, _::chunk_width);
+    GPUMatrix<T, MatrixLayout::RowMajor> input(batch_size, _::chunk_width);
+    GPUMatrix<T, MatrixLayout::ColumnMajor> weights(_::chunk_width, _::chunk_width);
     GPUMatrix<T_ACC, MatrixLayout::RowMajor> output_expected(batch_size, _::chunk_width);
-    GPUMatrix<T_ST, MatrixLayout::RowMajor> output_actual(batch_size, _::storage_width);
+    GPUMatrix<T, MatrixLayout::RowMajor> output_actual(batch_size, _::storage_width);
 
     default_rng_t rng{1337};
 
     rng.advance();
-    linear_kernel(fill_rand<T_ST>, 0, nullptr, input.n_elements(), input.data(), rng);
+    linear_kernel(fill_rand<T>, 0, nullptr, input.n_elements(), input.data(), rng);
 
     rng.advance();
-    linear_kernel(fill_rand<T_ST>, 0, nullptr, weights.n_elements(), weights.data(), rng);
+    linear_kernel(fill_rand<T>, 0, nullptr, weights.n_elements(), weights.data(), rng);
 
     GemmOp gemm_op;
     cutlass::Status status;
@@ -157,127 +213,78 @@ std::enable_if_t<
         {1, 0}
     });
 
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error(std::string("Got cutlass error: ") + cutlass::cutlassGetStatusString(status));
-    }
+    ASSERT_EQ(status, cutlass::Status::kSuccess) << "Got cutlass error: " << cutlass::cutlassGetStatusString(status);
 
     assert(batch_size % _::chunk_height == 0);
 
     dim3 threads { 32, _::n_warps, 1 };
     dim3 blocks { batch_size / _::chunk_height, 1, 1 };
 
-#if false
-    std::cout << shmem_size_bytes << std::endl;
-    std::cout << _::shmem_size * sizeof(T_ST) << " " << _::acc_shmem_size * sizeof(T_ACC) << std::endl;
-
-    std::cout << "storage_size: " << sizeof(T_ST) << "\n"
-              << "accum_size: " << sizeof(T_ACC) << "\n"
-              << "block_height: " <<  _::block_height << "\n"
-              << "block_width: " << _::block_width << "\n"
-              << "n_blocks_col: " << _::n_blocks_col << "\n" 
-              << "n_blocks_row: " <<  _::n_blocks_row << "\n"
-              << "n_weight_blocks: " <<  _::n_weight_blocks << "\n"
-              << "n_warps_col: " << _::n_warps_col << "\n"
-              << "n_warps_row: " << _::n_warps_row << "\n"
-              << "n_iters_col: " << _::n_iters_col << "\n"
-              << "n_iters_row: " << _::n_iters_row << "\n"
-              << "width_offset: " << _::width_offset << "\n"
-              << "height_offset: " << _::height_offset << "\n"
-              << "chunk_height: " << _::chunk_height << "\n"
-              << "chunk_size: " << _::chunk_size << "\n" 
-              << "storage_chunk_size: " << _::storage_chunk_size << "\n" 
-              << "storage_width: " <<_::storage_width << "\n"
-              << "storage_block_width: " <<_::storage_block_width << "\n"
-              << "shmem_skew: " <<_::shmem_skew << "\n"
-              << "shmem_stride: " <<_::shmem_stride << "\n"
-              << "shmem_size: " <<_::shmem_size << "\n"
-              << "acc_shmem_skew: " <<_::acc_shmem_skew << "\n"
-              << "acc_shmem_stride: " <<_::acc_shmem_stride << "\n"
-              << "acc_shmem_size: " <<_::acc_shmem_size << "\n"
-              << "num_lanes: " << threads.x << "\n"
-              << "num_warps: " << threads.y << "\n"
-              << "num_blocks: " << blocks.x << "\n"
-              << std::endl;
-#endif
-
-    int shmem_size_bytes = _::shmem_size * sizeof(T_ST) + 
+    int shmem_size_bytes = _::shmem_size * sizeof(T) + 
                            (std::is_same<T, T_ACC>::value ? 0 : _::acc_shmem_size * sizeof(T_ACC));
 
-    CUDA_CHECK_THROW(cudaFuncSetAttribute(test_kernel<CalculationPolicy>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes));
+    ASSERT_NO_THROW(CUDA_CHECK_THROW(
+        cudaFuncSetAttribute(test_kernel<CalculationPolicy>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes)));
+
     test_kernel<CalculationPolicy><<<blocks, threads, shmem_size_bytes>>>(input.data(), weights.data(), output_actual.data());
-    CUDA_CHECK_THROW(cudaDeviceSynchronize());
+    ASSERT_NO_THROW(CUDA_CHECK_THROW(cudaDeviceSynchronize()));
 
-#if false
-    std::vector<T_ST> input_cpu(batch_size * _::storage_width);
-    std::vector<T_ACC> output_expected_cpu(batch_size * _::storage_width);
-    std::vector<T_ST> output_actual_cpu(batch_size * _::storage_width);
-
-    CUDA_CHECK_THROW(cudaMemcpy(input_cpu.data(), input.data(), input.n_elements() * sizeof(T_ST), cudaMemcpyDeviceToHost));
-    CUDA_CHECK_THROW(cudaMemcpy(output_expected_cpu.data(), output_expected.data(), output_expected.n_elements() * sizeof(T_ACC), cudaMemcpyDeviceToHost));
-    CUDA_CHECK_THROW(cudaMemcpy(output_actual_cpu.data(), output_actual.data(), output_actual.n_elements() * sizeof(T_ST), cudaMemcpyDeviceToHost));
-
-    printf("INPUT\n");
-    for (int i = 0; i < min(batch_size, 16); ++i) {
-        printf("%4d I ", i);
-        for (int j = 0; j < _::storage_width; ++j) {
-            if (std::is_same<T, __half>::value) {
-                printf("%8.3f ", (float)input_cpu[i * _::storage_width + j]);
-            } else if(std::is_same<T, int8_t>::value) {
-                int x = (int8_t)(float)input_cpu[i * _::storage_width + j];
-                printf("%5d ", (int)x);
-            } else {
-                uint32_t x = input_cpu[i * _::storage_width + j];
-                for (int k = 0; k < 32; ++k) {
-                    printf((x & (1 << k)) ? "1" : "0");
-                    if (k % 8 == 7) printf(" ");
-                }
-                printf(" ");
-            }
-        }
-        printf("\n");
-    }
-    printf("\n\n");
-
-    for (int i = 0; i < min(batch_size, 1024); ++i) {
-        printf("%4d E ", i);
-        for (int j = 0; j < _::storage_width; ++j) {
-            if (std::is_same<T, __half>::value) {
-                printf("%8.3f ", (float)output_expected_cpu[i * _::storage_width + j]);
-            } else if(std::is_same<T, int8_t>::value) {
-                printf("%5d ", (int8_t)(float)output_expected_cpu[i * _::storage_width + j]);
-            } else {
-                uint32_t x = output_expected_cpu[i * _::storage_width + j];
-                for (int k = 0; k < 32; ++k) {
-                    printf((x & (1 << k)) ? "1" : "0");
-                    if (k % 8 == 7) printf(" ");
-                }
-                printf(" ");
-            }
-
-        }
-        printf("\n     A ");
-
-        for (int j = 0; j < _::storage_width; ++j) {
-            if (std::is_same<T, __half>::value) {
-                printf("%8.3f ", (float)output_actual_cpu[i * _::chunk_width + j]);
-            } else if(std::is_same<T, int8_t>::value) {
-                printf("%5d ", (int)output_actual_cpu[i * _::chunk_width + j]);
-            } else {
-                uint32_t x = output_actual_cpu[i * _::storage_width + j];
-                for (int k = 0; k < 32; ++k) {
-                    printf((x & (1 << k)) ? "1" : "0");
-                    if (k % 8 == 7) printf(" ");
-                }
-                printf(" ");
-            }
-        }
-        printf("\n\n");
-    }
-#endif
-
-    linear_kernel(check<T, T_ACC>, 0, nullptr, output_expected.n_elements(), output_expected.data(), output_actual.data());
+    linear_kernel(check<T, T_ST, T_ACC>, 0, nullptr, output_expected.n_elements(), output_expected.data(), output_actual.data());
  
-    CUDA_CHECK_THROW(cudaDeviceSynchronize());
+    ASSERT_NO_THROW(CUDA_CHECK_THROW(cudaDeviceSynchronize()));
+
+    cudaError_t err = cudaGetLastError();
+    ASSERT_EQ(err, cudaSuccess) << cudaGetErrorString(err);
+}
+
+template <typename CalculationPolicy>
+std::enable_if_t< std::is_same_v<typename CalculationPolicy::mm_type, uint1b_t> > 
+test(uint32_t batch_size) {
+    using _ = CalculationPolicy;
+    using T = typename CalculationPolicy::mm_type;
+    using T_ST = typename CalculationPolicy::storage_type;
+    using T_ACC = typename CalculationPolicy::accumulator_type;
+
+    GPUMatrix<T_ST, MatrixLayout::RowMajor> input(batch_size, _::storage_width);
+    GPUMatrix<T_ST, MatrixLayout::ColumnMajor> weights(_::storage_width, _::chunk_width);
+    GPUMatrix<T_ST, MatrixLayout::ColumnMajor> padded_weights(_::padded_storage_width, _::chunk_width);
+    GPUMatrix<T_ACC, MatrixLayout::RowMajor> output_expected(batch_size, _::chunk_width);
+    GPUMatrix<T_ST, MatrixLayout::RowMajor> output_actual(batch_size, _::storage_width);
+
+    default_rng_t rng{1337};
+
+    rng.advance();
+    linear_kernel(fill_rand<T_ST>, 0, nullptr, input.n_elements(), input.data(), rng);
+
+    rng.advance();
+    linear_kernel(fill_rand<T_ST>, 0, nullptr, weights.n_elements(), weights.data(), rng);
+
+    copy_weights_with_pad<<<batch_size * _::padded_storage_width / 128, 128>>>(_::storage_width, _::padded_storage_width, padded_weights.data(), weights.data());
+
+    assert(batch_size % _::chunk_height == 0);
+
+    {
+        int threads = _::chunk_width;
+        int blocks = batch_size;
+        naive_bmm<_::chunk_width><<<blocks, threads>>>(input.data(), weights.data(), output_expected.data());
+        ASSERT_NO_THROW(CUDA_CHECK_THROW(cudaDeviceSynchronize()));
+    }
+
+    {
+        dim3 threads { 32, _::n_warps, 1 };
+        dim3 blocks { batch_size / _::chunk_height, 1, 1 };
+
+        int shmem_size_bytes = _::shmem_size * sizeof(T_ST) + 
+                            (std::is_same<T, T_ACC>::value ? 0 : _::acc_shmem_size * sizeof(T_ACC));
+
+        ASSERT_NO_THROW(CUDA_CHECK_THROW(cudaFuncSetAttribute(test_kernel<CalculationPolicy>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size_bytes)));
+        test_kernel<CalculationPolicy><<<blocks, threads, shmem_size_bytes>>>(input.data(), padded_weights.data(), output_actual.data());
+        ASSERT_NO_THROW(CUDA_CHECK_THROW(cudaDeviceSynchronize()));
+    }
+
+    linear_kernel(check<T, T_ST, T_ACC>, 0, nullptr, output_actual.n_elements(), output_expected.data(), output_actual.data());
+ 
+    ASSERT_NO_THROW(CUDA_CHECK_THROW(cudaDeviceSynchronize()));
 
     cudaError_t err = cudaGetLastError();
     ASSERT_EQ(err, cudaSuccess) << cudaGetErrorString(err);
@@ -326,63 +333,43 @@ void bench(uint32_t batch_size) {
     std::cout << std::setw(10) << (float)std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / 1'000'000 / n_batches << " ms/batch" << std::endl;
 }
 
-TEST(QATThreadblockForward, Half) {
-    using HalfTestPolicy = FulllyFusedMatMulCalculationPolicy<
-        /*T=*/ __half,
-        /*WIDTH=*/ 128,
-        /*HEIGHT=*/ 128,
-        /*N_WARPS_COL=*/ 8,
-        /*N_WARPS_ROW=*/ 1,
-        /*T_COPY=*/ uint4
-    >;
+template <uint32_t width> using HalfTestPolicy = FulllyFusedMatMulCalculationPolicy<
+    /*T=*/ __half,
+    /*WIDTH=*/ width,
+    /*HEIGHT=*/ 128,
+    /*N_WARPS_COL=*/ width / 16,
+    /*N_WARPS_ROW=*/ 1,
+    /*T_COPY=*/ uint4
+>;
 
-    test<HalfTestPolicy>(1024);
-}
+template <uint32_t width> using Int8TestPolicy = FulllyFusedMatMulCalculationPolicy<
+    /*T=*/ int8_t,
+    /*WIDTH=*/ width,
+    /*HEIGHT=*/ 128,
+    /*N_WARPS_COL=*/ width / 16,
+    /*N_WARPS_ROW=*/ 1,
+    /*T_COPY=*/ uint4
+>;
 
-TEST(QATThreadblockForward, Int8) {
-    using Int8TestPolicy = FulllyFusedMatMulCalculationPolicy<
-        /*T=*/ int8_t,
-        /*WIDTH=*/ 128,
-        /*HEIGHT=*/ 128,
-        /*N_WARPS_COL=*/ 8,
-        /*N_WARPS_ROW=*/ 1,
-        /*T_COPY=*/ uint4
-    >;
-    
-    test<Int8TestPolicy>(1024);
-}
- 
+template <uint32_t width> using BitTestPolicy = FulllyFusedMatMulCalculationPolicy<
+    /*T=*/ uint1b_t,
+    /*WIDTH=*/ width,
+    /*HEIGHT=*/ 128,
+    /*N_WARPS_COL=*/ width / 8 < 8 ? width / 8 : 8,
+    /*N_WARPS_ROW=*/ 1,
+    /*T_COPY=*/ uint32_t
+>;
 
-// int main () {
-    // func<__half>();
-    // func<bit4_t>();
-    // tcnn::GPUMatrix<bit_t> a(128, 128);
-    // std::cout << sizeof(a.data()) << std::endl;
-    // std::cout << sizeof(typename bit_t::storage_element_type) << std::endl;
+TEST(QATThreadblockForward, Half16) { test<HalfTestPolicy<16>>(1024); }
+TEST(QATThreadblockForward, Half32) { test<HalfTestPolicy<32>>(1024); }
+TEST(QATThreadblockForward, Half64) { test<HalfTestPolicy<64>>(1024); }
+TEST(QATThreadblockForward, Half128) { test<HalfTestPolicy<128>>(1024); }
 
-    // using Int8TestPolicy  = FulllyFusedMatMulCalculationPolicy<   int8_t, /*WIDTH=*/128, /*HEIGHT=*/128, /*N_WARPS_COL=*/ 8, /*N_WARPS_ROW=*/1, /*T_COPY=*/uint4    >;
-    // using BMMTestPolicy4  = FulllyFusedMatMulCalculationPolicy< uint1b_t, /*WIDTH=*/128, /*HEIGHT=*/128, /*N_WARPS_COL=*/ 4, /*N_WARPS_ROW=*/1, /*T_COPY=*/uint4    >;
-    // using BMMTestPolicy8  = FulllyFusedMatMulCalculationPolicy< uint1b_t, /*WIDTH=*/128, /*HEIGHT=*/128, /*N_WARPS_COL=*/ 8, /*N_WARPS_ROW=*/1, /*T_COPY=*/uint2    >;
-    // using BMMTestPolicy16 = FulllyFusedMatMulCalculationPolicy< uint1b_t, /*WIDTH=*/128, /*HEIGHT=*/128, /*N_WARPS_COL=*/16, /*N_WARPS_ROW=*/1, /*T_COPY=*/uint32_t >;
+TEST(QATThreadblockForward, Int8x16) { test<Int8TestPolicy<16>>(1024); }
+TEST(QATThreadblockForward, Int8x32) { test<Int8TestPolicy<32>>(1024); }
+TEST(QATThreadblockForward, Int8x64) { test<Int8TestPolicy<64>>(1024); }
+TEST(QATThreadblockForward, Int8x128) { test<Int8TestPolicy<128>>(1024); }
 
-    // using BMMTestPolicy16 = FulllyFusedMatMulCalculationPolicy< uint1b_t, /*WIDTH=*/256, /*HEIGHT=*/128, /*N_WARPS_COL=*/16, /*N_WARPS_ROW=*/1, /*T_COPY=*/uint32_t >;
-
-
-    // using HalfTestPolicy64  = FulllyFusedMatMulCalculationPolicy<   __half, /*WIDTH=*/64, /*HEIGHT=*/128, /*N_WARPS_COL=*/ 4, /*N_WARPS_ROW=*/1, /*T_COPY=*/uint4    >;
-    // using Int8TestPolicy64  = FulllyFusedMatMulCalculationPolicy<   int8_t, /*WIDTH=*/64, /*HEIGHT=*/128, /*N_WARPS_COL=*/ 4, /*N_WARPS_ROW=*/1, /*T_COPY=*/uint4    >;
-    // using Int4TestPolicy64  = FulllyFusedMatMulCalculationPolicy<  int4b_t, /*WIDTH=*/64, /*HEIGHT=*/128, /*N_WARPS_COL=*/ 8, /*N_WARPS_ROW=*/1, /*T_COPY=*/uint4    >;
-
-    // size_t batch_size = 1 << 23; //  (free - weights_size) * 0.95 / (2 * sample_size);
-
-    // bench<HalfTestPolicy>(batch_size);
-    // bench<Int8TestPolicy>(batch_size);
-    // bench<BMMTestPolicy4>(batch_size);
-    // bench<BMMTestPolicy8>(batch_size);
-    // bench<BMMTestPolicy16>(batch_size);
-
-    // bench<HalfTestPolicy64>(batch_size);
-    // bench<Int8TestPolicy64>(batch_size);
-    // bench<Int4TestPolicy64>(batch_size);
-
-//     return 0;
-// }
+TEST(QATThreadblockForward, Bit32) { test<BitTestPolicy<32>>(1024); }
+TEST(QATThreadblockForward, Bit64) { test<BitTestPolicy<64>>(1024); }
+TEST(QATThreadblockForward, Bit128) { test<BitTestPolicy<128>>(1024); }
