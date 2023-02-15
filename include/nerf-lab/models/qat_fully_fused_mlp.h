@@ -142,23 +142,23 @@ __device__ void threadblock_load_input_static(
 ) {
     using _ = CalculationPolicy;
 
-	const uint32_t lane_idx = threadIdx.x;
-	const uint32_t warp_idx = threadIdx.y;
+    const uint32_t lane_idx = threadIdx.x;
+    const uint32_t warp_idx = threadIdx.y;
 
-	const uint32_t col = (lane_idx * _::copy_stride) % _::storage_width;
-	const uint32_t row = (lane_idx + warp_idx * _::warp_size) * _::copy_stride / _::storage_width;
+    const uint32_t col = (lane_idx * _::copy_stride) % _::storage_width;
+    const uint32_t row = (lane_idx + warp_idx * _::warp_size) * _::copy_stride / _::storage_width;
 
     // each lane (of `warp_size` lanes) copies `copy_stride` elements in single vector uint4 operation (or different T_COPY type, if specified)
     // each warp (of `n_warps` warps) copies `warp_size * copy_stride` elements
     // full threadblock copies then `n_warps * warp_size * copy_stride` elements at once, 
     // then repeats untill all of `storage_chunk_size` elements are copied.
-	#pragma unroll
-	for (uint32_t offset = 0; offset < _::storage_chunk_size; offset += _::copy_step) {
+    #pragma unroll
+    for (uint32_t offset = 0; offset < _::storage_chunk_size; offset += _::copy_step) {
         const uint32_t shmem_offset = offset / _::storage_width * _::shmem_stride;
 
-		*(T_COPY*)&act_shmem[shmem_offset + row * _::shmem_stride + col] = 
+        *(T_COPY*)&act_shmem[shmem_offset + row * _::shmem_stride + col] = 
             *(T_COPY*)&input_threadblock[offset + row * _::storage_width + col];
-	}
+    }
 
     __syncthreads();
 }
@@ -179,18 +179,18 @@ __device__ void threadblock_store_output_static(
 ) {
     using _ = CalculationPolicy;
 
-	const uint32_t lane_idx = threadIdx.x;
-	const uint32_t warp_idx = threadIdx.y;
+    const uint32_t lane_idx = threadIdx.x;
+    const uint32_t warp_idx = threadIdx.y;
 
-	const uint32_t col = (lane_idx * _::copy_stride) % _::storage_width;
-	const uint32_t row = (lane_idx + warp_idx * _::warp_size) * _::copy_stride / _::storage_width;
+    const uint32_t col = (lane_idx * _::copy_stride) % _::storage_width;
+    const uint32_t row = (lane_idx + warp_idx * _::warp_size) * _::copy_stride / _::storage_width;
 
-	TCNN_PRAGMA_UNROLL
-	for (int offset = 0; offset < _::storage_chunk_size; offset += _::copy_step) {
+    TCNN_PRAGMA_UNROLL
+    for (int offset = 0; offset < _::storage_chunk_size; offset += _::copy_step) {
         const uint32_t shmem_offset = offset / _::storage_width * _::shmem_stride;
 
-		*(T_COPY*)&output_threadblock[offset + row * _::storage_width + col] = *(T_COPY*)&act_shmem[shmem_offset + row * _::shmem_stride + col];
-	}
+        *(T_COPY*)&output_threadblock[offset + row * _::storage_width + col] = *(T_COPY*)&act_shmem[shmem_offset + row * _::shmem_stride + col];
+    }
 
     __syncthreads();
 }
@@ -207,15 +207,15 @@ __device__ void fill_zeroes(
     constexpr uint32_t copy_stride = sizeof(uint32_t) / sizeof(T_ST);
     constexpr uint32_t copy_step = _::n_warps * _::warp_size * copy_stride;
 
-	const uint32_t lane_idx = threadIdx.x;
-	const uint32_t warp_idx = threadIdx.y;
+    const uint32_t lane_idx = threadIdx.x;
+    const uint32_t warp_idx = threadIdx.y;
 
     const uint32_t i = (warp_idx * _::warp_size + lane_idx) * copy_stride;
 
-	#pragma unroll
-	for (uint32_t offset = 0; offset < _::shmem_size; offset += copy_step) {
-		*(uint32_t*)&act_shmem[offset + i] = 0;
-	}
+    #pragma unroll
+    for (uint32_t offset = 0; offset < _::shmem_size; offset += copy_step) {
+        *(uint32_t*)&act_shmem[offset + i] = 0;
+    }
 
     __syncthreads(); 
 
@@ -231,7 +231,7 @@ __device__ void fill_zeroes(
     //     printf("\n");
     // }
 
-    // __syncthreads();
+// __syncthreads();
 }
 
 template <typename T, typename CalculationPolicy>
@@ -486,41 +486,41 @@ __device__ void qat_threadblock_layer(
     const T_ST* __restrict__ activation_aux = nullptr,
           T_ACC* __restrict__ aux_shmem = nullptr
 ) {
-	using namespace nvcuda;
+    using namespace nvcuda;
     using _ = CalculationPolicy;
 
     constexpr bool half_mode = std::is_same<T, __half>::value;
 
     static_assert(!BACKWARD || half_mode, "Backward threadblock layer is available only for T=__half, "
-                                          "integer types should be used for inference only!");
+                                            "integer types should be used for inference only!");
     static_assert(!half_mode || !_::partial_tc_load, "In half mode width should not be less than block width!");
     static_assert(!half_mode || _::n_iters_col == 1, "If use half mode, matmul result is stored inplace into shared memory, "
-                                                     "so we write to the matrix rows from which then read for further multiplications, "
-                                                     "if all operations are not done in parallel. "
-                                                     "To obtain this behavior try set N_WARPS_COLS = WIDTH / 16");
-                                                     
-	// If we're performing the backward pass, weights must be loaded in transposed form, which
-	// is achieved by interpreting the memory in row_major instead of col_major order.
-	using weights_layout_t = std::conditional_t<BACKWARD, wmma::row_major, wmma::col_major>;
+                                                        "so we write to the matrix rows from which then read for further multiplications, "
+                                                        "if all operations are not done in parallel. "
+                                                        "To obtain this behavior try set N_WARPS_COLS = WIDTH / 16");
+                                                        
+    // If we're performing the backward pass, weights must be loaded in transposed form, which
+    // is achieved by interpreting the memory in row_major instead of col_major order.
+    using weights_layout_t = std::conditional_t<BACKWARD, wmma::row_major, wmma::col_major>;
 
     constexpr uint32_t M = _::block_height;
     constexpr uint32_t N = _::block_height;
     constexpr uint32_t K = _::block_width;
 
-	// Fragments
-	wmma::fragment<wmma::matrix_a, M, N, K, T, wmma::row_major> act_frag;
-	wmma::fragment<wmma::matrix_b, M, N, K, T, weights_layout_t> weights_frag[_::n_weight_blocks];
-	wmma::fragment<wmma::accumulator, M, N, K, T_ACC> result_frag[_::n_iters_row];
+    // Fragments
+    wmma::fragment<wmma::matrix_a, M, N, K, T, wmma::row_major> act_frag;
+    wmma::fragment<wmma::matrix_b, M, N, K, T, weights_layout_t> weights_frag[_::n_weight_blocks];
+    wmma::fragment<wmma::accumulator, M, N, K, T_ACC> result_frag[_::n_iters_row];
 
-	const uint32_t warp_idx = threadIdx.y;
+    const uint32_t warp_idx = threadIdx.y;
 
-	const uint32_t col_offset = _::width_offset * (warp_idx % _::n_warps_col);
+    const uint32_t col_offset = _::width_offset * (warp_idx % _::n_warps_col);
     const uint32_t row_offset = _::height_offset * (warp_idx / _::n_warps_col);
 
     #pragma unroll
     for (uint32_t iter_col = 0; iter_col < _::n_iters_col; ++iter_col) {
         const uint32_t weights_col = col_offset + iter_col * _::block_height;
-     
+        
         // Load N_BLOCKS chunks of weights from global memory into registers.
         #pragma unroll
         for (uint32_t block = 0; block < _::n_weight_blocks; ++block) {
@@ -614,143 +614,143 @@ __device__ void qat_threadblock_layer(
         NumericConverter<T, CalculationPolicy>::convert(act_shmem, aux_shmem);
     }
 
-	if (out_intermediate_threadblock_this_layer != nullptr) {
-		__syncthreads();
+    if (out_intermediate_threadblock_this_layer != nullptr) {
+        __syncthreads();
 
         threadblock_store_output_static<CalculationPolicy>(out_intermediate_threadblock_this_layer, act_shmem);
-	}
+    }
 }
 
 /*
 template <typename T, int WIDTH>
 class FullyFusedQATMLP : public Network<T> {
 public:
-	FullyFusedQATMLP(uint32_t input_width, uint32_t output_width, uint32_t n_hidden_layers, Activation activation, Activation output_activation);
+    FullyFusedQATMLP(uint32_t input_width, uint32_t output_width, uint32_t n_hidden_layers, Activation activation, Activation output_activation);
 
-	void inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<T>& input, GPUMatrixDynamic<T>& output, bool use_inference_params = true) override;
+    void inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<T>& input, GPUMatrixDynamic<T>& output, bool use_inference_params = true) override;
 
-	std::unique_ptr<Context> forward_impl(cudaStream_t stream, const GPUMatrixDynamic<T>& input, GPUMatrixDynamic<T>* output = nullptr, bool use_inference_params = false, bool prepare_input_gradients = false) override;
+    std::unique_ptr<Context> forward_impl(cudaStream_t stream, const GPUMatrixDynamic<T>& input, GPUMatrixDynamic<T>* output = nullptr, bool use_inference_params = false, bool prepare_input_gradients = false) override;
 
-	void backward_impl(
-		cudaStream_t stream,
-		const Context& ctx,
-		const GPUMatrixDynamic<T>& input,
-		const GPUMatrixDynamic<T>& output,
-		const GPUMatrixDynamic<T>& dL_doutput,
-		GPUMatrixDynamic<T>* dL_dinput = nullptr,
-		bool use_inference_params = false,
-		EGradientMode param_gradients_mode = EGradientMode::Overwrite
-	) override;
+    void backward_impl(
+        cudaStream_t stream,
+        const Context& ctx,
+        const GPUMatrixDynamic<T>& input,
+        const GPUMatrixDynamic<T>& output,
+        const GPUMatrixDynamic<T>& dL_doutput,
+        GPUMatrixDynamic<T>* dL_dinput = nullptr,
+        bool use_inference_params = false,
+        EGradientMode param_gradients_mode = EGradientMode::Overwrite
+    ) override;
 
-	void set_params_impl(T* params, T* inference_params, T* gradients) override;
-	void initialize_params(pcg32& rnd, float* params_full_precision, float scale = 1) override;
+    void set_params_impl(T* params, T* inference_params, T* gradients) override;
+    void initialize_params(pcg32& rnd, float* params_full_precision, float scale = 1) override;
 
-	GPUMatrix<T, RM>& input_weight_matrix(bool inference) {
-		auto& weight_matrices = inference ? m_weight_matrices_inference : m_weight_matrices;
-		return weight_matrices.front();
-	}
+    GPUMatrix<T, RM>& input_weight_matrix(bool inference) {
+        auto& weight_matrices = inference ? m_weight_matrices_inference : m_weight_matrices;
+        return weight_matrices.front();
+    }
 
-	GPUMatrix<T, RM>& weight_matrix_at(bool inference, uint32_t idx) {
-		auto& weight_matrices = inference ? m_weight_matrices_inference : m_weight_matrices;
-		return weight_matrices.at(1 + idx);
-	}
+    GPUMatrix<T, RM>& weight_matrix_at(bool inference, uint32_t idx) {
+        auto& weight_matrices = inference ? m_weight_matrices_inference : m_weight_matrices;
+        return weight_matrices.at(1 + idx);
+    }
 
-	GPUMatrix<T, RM>& output_weight_matrix(bool inference) {
-		auto& weight_matrices = inference ? m_weight_matrices_inference : m_weight_matrices;
-		return weight_matrices.back();
-	}
+    GPUMatrix<T, RM>& output_weight_matrix(bool inference) {
+        auto& weight_matrices = inference ? m_weight_matrices_inference : m_weight_matrices;
+        return weight_matrices.back();
+    }
 
-	GPUMatrix<T, RM>& input_gradient_matrix() {
-		return m_gradient_matrices.front();
-	}
+    GPUMatrix<T, RM>& input_gradient_matrix() {
+        return m_gradient_matrices.front();
+    }
 
-	GPUMatrix<T, RM>& gradient_matrix_at(uint32_t idx) {
-		return m_gradient_matrices.at(1 + idx);
-	}
+    GPUMatrix<T, RM>& gradient_matrix_at(uint32_t idx) {
+        return m_gradient_matrices.at(1 + idx);
+    }
 
-	GPUMatrix<T, RM>& output_gradient_matrix() {
-		return m_gradient_matrices.back();
-	}
+    GPUMatrix<T, RM>& output_gradient_matrix() {
+        return m_gradient_matrices.back();
+    }
 
-	size_t n_params() const override {
-		return m_total_n_params;
-	}
+    size_t n_params() const override {
+        return m_total_n_params;
+    }
 
-	uint32_t input_width() const override {
-		return m_input_width;
-	}
+    uint32_t input_width() const override {
+        return m_input_width;
+    }
 
-	uint32_t padded_output_width() const override {
-		return m_padded_output_width;
-	}
+    uint32_t padded_output_width() const override {
+        return m_padded_output_width;
+    }
 
-	uint32_t output_width() const override {
-		return m_output_width;
-	}
+    uint32_t output_width() const override {
+        return m_output_width;
+    }
 
-	static uint32_t REQUIRED_ALIGNMENT() {
-		return 16; // Uses 16x16x16 tensor ops
-	}
+    static uint32_t REQUIRED_ALIGNMENT() {
+        return 16; // Uses 16x16x16 tensor ops
+    }
 
-	uint32_t required_input_alignment() const override {
-		return REQUIRED_ALIGNMENT();
-	}
+    uint32_t required_input_alignment() const override {
+        return REQUIRED_ALIGNMENT();
+    }
 
-	std::vector<std::pair<uint32_t, uint32_t>> layer_sizes() const override {
-		std::vector<std::pair<uint32_t, uint32_t>> result;
-		for (auto& matrix : m_weight_matrices) {
-			result.emplace_back(matrix.m(), matrix.n());
-		}
-		return result;
-	}
+    std::vector<std::pair<uint32_t, uint32_t>> layer_sizes() const override {
+        std::vector<std::pair<uint32_t, uint32_t>> result;
+        for (auto& matrix : m_weight_matrices) {
+            result.emplace_back(matrix.m(), matrix.n());
+        }
+        return result;
+    }
 
-	uint32_t width(uint32_t layer) const override {
-		return WIDTH;
-	}
+    uint32_t width(uint32_t layer) const override {
+        return WIDTH;
+    }
 
-	uint32_t num_forward_activations() const override {
-		return m_n_hidden_layers;
-	}
+    uint32_t num_forward_activations() const override {
+        return m_n_hidden_layers;
+    }
 
-	std::pair<const T*, MatrixLayout> forward_activations(const Context& ctx, uint32_t layer) const override {
-		const auto& forward = dynamic_cast<const ForwardContext&>(ctx);
-		return {forward.hidden.at(layer).data(), CM};
-	}
+    std::pair<const T*, MatrixLayout> forward_activations(const Context& ctx, uint32_t layer) const override {
+        const auto& forward = dynamic_cast<const ForwardContext&>(ctx);
+        return {forward.hidden.at(layer).data(), CM};
+    }
 
-	json hyperparams() const override {
-		return {
-			{"otype", "FullyFusedQATMLP"},
-			{"activation", to_string(m_activation)},
-			{"output_activation", to_string(m_output_activation)},
-			{"n_neurons", m_network_width},
-			{"n_hidden_layers", m_n_hidden_layers},
-		};
-	}
+    json hyperparams() const override {
+        return {
+            {"otype", "FullyFusedQATMLP"},
+            {"activation", to_string(m_activation)},
+            {"output_activation", to_string(m_output_activation)},
+            {"n_neurons", m_network_width},
+            {"n_hidden_layers", m_n_hidden_layers},
+        };
+    }
 
 private:
-	struct ForwardContext : public Context {
-		std::vector<GPUMatrix<T>> hidden;
-		GPUMemoryArena::Allocation alloc;
-	};
+    struct ForwardContext : public Context {
+        std::vector<GPUMatrix<T>> hidden;
+        GPUMemoryArena::Allocation alloc;
+    };
 
-	std::unique_ptr<ForwardContext> allocate_forward_buffers(cudaStream_t stream, uint32_t batch_size);
+    std::unique_ptr<ForwardContext> allocate_forward_buffers(cudaStream_t stream, uint32_t batch_size);
 
-	uint32_t m_n_hidden_layers;
-	uint32_t m_n_hidden_matmuls;
-	uint32_t m_input_width;
-	uint32_t m_network_width;
-	uint32_t m_output_width;
-	uint32_t m_padded_output_width;
+    uint32_t m_n_hidden_layers;
+    uint32_t m_n_hidden_matmuls;
+    uint32_t m_input_width;
+    uint32_t m_network_width;
+    uint32_t m_output_width;
+    uint32_t m_padded_output_width;
 
-	Activation m_activation;
-	Activation m_output_activation;
+    Activation m_activation;
+    Activation m_output_activation;
 
-	// Storage of params
-	std::vector<GPUMatrix<T, RM>> m_weight_matrices;
-	std::vector<GPUMatrix<int8_t, RM>> m_weight_matrices_inference;
-	size_t m_total_n_params;
+    // Storage of params
+    std::vector<GPUMatrix<T, RM>> m_weight_matrices;
+    std::vector<GPUMatrix<int8_t, RM>> m_weight_matrices_inference;
+    size_t m_total_n_params;
 
-	std::vector<GPUMatrix<T, RM>> m_gradient_matrices;
+    std::vector<GPUMatrix<T, RM>> m_gradient_matrices;
 };
 */
 
