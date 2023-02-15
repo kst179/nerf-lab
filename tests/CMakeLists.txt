@@ -20,3 +20,4 @@ include(GoogleTest)
 
 add_test(cuda_reduce_test cuda_reduce_test.cu)
 add_test(volume_renderer_test volume_renderer_test.cu)
+add_test(qat_threadblock_layer_test qat_threadblock_layer_test.cu)
